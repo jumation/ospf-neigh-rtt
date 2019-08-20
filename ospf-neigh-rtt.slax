@@ -1,0 +1,390 @@
+/*
+ * Title               : ospf-neigh-rtt
+ * Last modified date  : 5.05.2019
+ * Author              : jumation.com
+ * Description         : By default, sends 20 ICMP "echo request" messages to
+ *                       each directly connected OSPFv2 neighbor and 20 ICMPv6
+ *                       "echo request" messages to each directly connected
+ *                       OSPFv3 neighbor on every five minutes and makes the
+ *                       RTT available via Junos SNMP agent.
+ * Options             :
+ * Notes               : Requires Junos 14.1 or newer.
+ *                       Event policy is embedded in the script.
+ *                       Because of behavior described in KB11792 and KB28157
+ *                       such measurement method is suitable if high accuracy
+ *                       is not needed. For highly accurate RTT measurements RPM
+ *                       "icmp-ping" type probes with "hardware-timestamp", ITU-T
+ *                       Y.1731 ETH-DM with "hardware-assisted-timestamping" in
+ *                       case of Ethernet links or external (Linux based) moni-
+ *                       toring servers can be used.
+ *                       Junos 'default-address-selection' does not affect the
+ *                       script because it binds to destined IPv4/IPv6 address.
+ *                       In case of OSPFv2, the source IPv4 address for ping is
+ *                       the numerically lowest local address configured on the
+ *                       outgoing interface which falls in the same network as
+ *                       the destination address. For OSPFv3, the ping utility
+ *                       binds to outgoing interface link-local address. Unlike
+ *                       for example Linux or FreeBSD, Junos allows to have one
+ *                       IPv6 link-local address per IFL.
+ *                       Some punctuation characters like unclosed quotes in
+ *                       interface description can cause creating the SNMP
+ *                       instance to fail.
+ */
+
+version 1.1;
+
+ns junos = "http://xml.juniper.net/junos/*/junos";
+ns jcs = "http://xml.juniper.net/junos/commit-scripts/1.0";
+ns xnm = "http://xml.juniper.net/xnm/1.1/xnm";
+ns bit extension = "http://xml.libslax.org/bit";
+ns math = "http://exslt.org/math";
+ns jumation = "https://www.jumation.com/slaxfunctions";
+
+import "../import/junos.xsl";
+
+
+var $event-definition = {
+	<event-options> {
+		<generate-event> {
+			<name> "300s";
+			<time-interval> "300";
+			<no-drift>;
+		}
+		<policy> {
+			<name> "ospf-neigh-rtt";
+			<events> "300s";
+			<then> {
+				<event-script> {
+					<name> "ospf-neigh-rtt.slax";
+				}
+			}
+		}
+	}
+}
+
+
+/*
+ * If true(), then RTT results, info about dead OSPFv2/OSPFv3 neighbors, etc
+ * is also sent to syslog.
+ */
+var $debug = false();
+
+
+/* Convert IPv4 address from dotted-decimal notation to integer. */
+function jumation:ip-to-int($ip) {
+
+	/*
+	 * Double-escaping is needed because the SLAX to XSLT
+	 * conversion will remove one of the backslashes.
+	 */
+	var $o = jcs:split("\\.", $ip);
+	var $int = (16777216 * $o[1]) + (65536 * $o[2]) + (256 * $o[3]) + $o[4];
+
+	result $int;
+}
+
+
+/* Return the numerically lowest IPv4 address of the matching subnet. */
+function jumation:lowest-matching-ip($ip, $prefixes) {
+
+	var $ipint = jumation:ip-to-int($ip);
+
+	var $matches := {
+		for-each($prefixes) {
+
+			var $prefix = jcs:split("/", .);
+
+			var $hostbits = 32 - $prefix[2];
+
+			var $netint = jumation:ip-to-int($prefix[1]);
+
+			var $binstring = bit:from-int($netint);
+
+			mvar $chop;
+			set $chop = 0;
+
+			for $i( 0 ... $hostbits - 1 ) {
+				if ( $i < string-length($binstring) ) {
+					var $shift = string-length($binstring) - $i;
+					set $chop = $chop +
+									substring($binstring, $shift, 1) *
+									math:power(2, $i);
+				}
+			}
+
+			var $minval = $netint - $chop;
+			var $maxval = $minval + math:power(2, $hostbits) - 1;
+
+
+			if ( $prefix[2] == 32 && $ip == $prefix[1] ) {
+				<entry> {
+					<ip> $prefix[1];
+					<ipint> $ipint;
+				}
+			}
+			else if ( $minval <= $ipint && $ipint <= $maxval ) {
+				<entry> {
+					<ip> $prefix[1];
+					<ipint> $netint;
+				}
+			}
+		}
+	}
+
+	mvar $maxip = 4294967296;
+	mvar $firstip;
+
+	for-each( $matches/entry ) {
+		if ( ipint < $maxip ) {
+			set $maxip = ipint;
+			set $firstip = ip;
+		}
+	}
+	result $firstip;
+}
+
+
+/*
+ * Return the IPv6 link-local address configured on the IFL.
+ * Junos allows one IPv6 link-local address per IFL.
+ */
+function jumation:find-link-local($prefixes) {
+
+	var $match := {
+		for-each($prefixes) {
+
+			var $prefix = jcs:split("/", .);
+
+			if ( jcs:regex("^fe[89ab]", $prefix[1]) ) {
+				<entry> {
+					<ip> $prefix[1];
+				}
+			}
+		}
+	}
+	result $match;
+}
+
+
+template exit($slvl = "error", $msg) {
+
+	expr jcs:syslog("external." _ $slvl, $script _ ": ", $msg);
+	terminate;
+
+}
+
+
+match / {
+	<event-script-results> {
+
+		var $con = jcs:open();
+
+		if (not($con)) {
+			call exit($msg = "Unable to connect to local mgd");
+		}
+
+
+		var $ospf_neigh = jcs:execute($con, "get-ospf-neighbor-information");
+
+		if ( $ospf_neigh/../xnm:error ) {
+			var $msg = "Error executing <get-ospf-neighbor-information> RPC";
+			call exit($msg);
+		}
+
+
+		var $ospf3_neigh = jcs:execute($con, "get-ospf3-neighbor-information");
+
+		if ( $ospf3_neigh/../xnm:error ) {
+			var $msg = "Error executing <get-ospf3-neighbor-information> RPC";
+			call exit($msg);
+		}
+
+
+		var $ints_info_rpc = {
+			<get-interface-information> {
+				<terse>;
+			}
+		}
+		var $ints_info = jcs:execute($con, $ints_info_rpc);
+
+		var $ints_descr_rpc = {
+			<get-interface-information> {
+				<descriptions>;
+			}
+		}
+		var $ints_descr = jcs:execute($con, $ints_descr_rpc);
+
+		if ( $ints_info/../xnm:error || $ints_descr/../xnm:error ) {
+			var $msg = "Error executing <get-interface-information> RPC";
+			call exit($msg);
+		}
+
+
+		/*
+		 * Ignore OSPF virtual-links as those can be not directly connected.
+		 * Depending on the environment, other (tunnel) interfaces can be
+		 * excluded as well. For example, '[not(starts-with(interface-name,
+		 * "vl-")) && not(starts-with(interface-name, "gr-"))]' to exclude
+		 * both virtual-links and GRE tunnels.
+		 */
+		for-each (($ospf_neigh/ospf-neighbor | $ospf3_neigh/ospf3-neighbor)
+									[not(starts-with(interface-name, "vl-"))]) {
+
+			var $int_name = interface-name;
+
+			var $int_desc = $ints_descr/logical-interface
+							[name == $int_name]/description;
+
+			var $src_ip := {
+				if ( name() == "ospf-neighbor" ) {
+					var $loc_ips = $ints_info/physical-interface/
+								logical-interface[name == $int_name]/
+								address-family[address-family-name = "inet"]/
+								interface-address/ifa-local;
+					expr jumation:lowest-matching-ip(neighbor-address, $loc_ips);
+				}
+				else if ( name() == "ospf3-neighbor" ) {
+					var $loc_ips = $ints_info/physical-interface/
+								logical-interface[name == $int_name]/
+								address-family[address-family-name = "inet6"]/
+								interface-address/ifa-local;
+					expr jumation:find-link-local($loc_ips);
+				}
+			}
+
+
+			var $ping_rpc = <ping> {
+				<host> neighbor-address;
+				<source> $src_ip;
+				<count> "20";
+				<interface> $int_name;
+				<rapid>;
+			}
+			var $ping_res = jcs:execute($con, $ping_rpc);
+			var $rtt_min = $ping_res/probe-results-summary/rtt-minimum div 1000;
+
+			if ($debug) {
+				var $msg = "RTT between " _ $src_ip _ "(" _ $int_name _ " " _
+							$hostname _ ") and " _ neighbor-address _ "(" _
+							$int_desc _ ") was " _ $rtt_min _ "ms";
+				expr jcs:syslog("external.info", $script _ ": ", $msg);
+			}
+
+
+			/*
+			 * If neighbor does not reply to echo request messages, then
+			 * <object-value> for SNMP agent is a "NaN".
+			 * Max instance length is 80 characters.
+			 */
+			var $iname = "rtt_" _ neighbor-address _
+							"_" _ $int_name _ "_" _ $int_desc;
+			var $set_mib_rpc = <request-snmp-utility-mib-set> {
+				<object-type> "string";
+				<instance> substring($iname, 1, 80);
+				<object-value> format-number($rtt_min, "0.0;#.#");
+			}
+			var $utilitymib_set = jcs:execute($con, $set_mib_rpc);
+
+			if ( $utilitymib_set/../xnm:error ) {
+				var $msg = "Error populating the Utility MIB for instance " _
+							"'rtt_" _ neighbor-address _ "_" _ $int_name _
+														"_" _ $int_desc _ "'";
+				expr jcs:syslog("external.error", $script _ ": ", $msg);
+			}
+		}
+
+
+		/*
+		 * As OIDs of the Utility MIB instances are created by appending the
+		 * ASCII numeric value of the instance name to the base OID and
+		 * as all the instance names share the "rtt_" prefix in their name,
+		 * then jnxUtilStringValue.114.116.116.95 is walked.
+		 */
+		var $walk_mib_rpc = <walk-snmp-object> {
+			<snmp-object-name> "jnxUtilStringValue.114.116.116.95";
+			<ascii>;
+		}
+		var $utilitymib_walk = jcs:execute($con, $walk_mib_rpc);
+
+		if ( $utilitymib_walk/../xnm:error ) {
+			var $msg = "Error executing <walk-snmp-object> RPC";
+			call exit($msg);
+		}
+
+
+		/*
+		 * Clear the instances with dead OSPF neighbors or changed
+		 * interface descriptions from the Utility MIB.
+		 */
+		for-each ($utilitymib_walk/snmp-object/index) {
+
+			var $neigh_addr = string(jcs:split("_", index-value)[2]);
+			var $ifl = string(jcs:split("_", index-value, 4)[3]);
+			var $int_descr = string(jcs:split("_", index-value, 4)[4]);
+
+			if (not(($ospf_neigh/ospf-neighbor | $ospf3_neigh/ospf3-neighbor)
+									[not(starts-with(interface-name, "vl-"))]
+									[neighbor-address == $neigh_addr])) {
+
+				if ($debug) {
+					var $msg = "Neighbor " _ $neigh_addr _ " is dead";
+					expr jcs:syslog("external.info", $script _ ": ", $msg);
+				}
+
+				var $clear_mib_rpc = <request-snmp-utility-mib-clear> {
+					<instance> index-value;
+					<object-type> "string";
+				}
+				var $utilitymib_clear = jcs:execute($con, $clear_mib_rpc);
+
+				if ( $utilitymib_clear/../xnm:error ) {
+					var $msg = "Error clearing the Utility MIB for instance " _
+								"'" _ index-value _ "'";
+					expr jcs:syslog("external.error", $script _ ": ", $msg);
+				}
+			}
+
+
+			/*
+			 * If interface has the description, but it is not the same as
+			 * last time when the script ran, then delete the instance from
+			 * the Utility MIB.
+			 */
+			if ($int_descr == "" &&
+					jcs:empty($ints_descr/logical-interface[name == $ifl])) {
+
+				if ($debug) {
+					var $msg = "Description for interface " _ $ifl _
+								" facing the neighbor " _ $neigh_addr _
+								" is empty";
+					expr jcs:syslog("external.info", $script _ ": ", $msg);
+				}
+
+			}
+			else if (($int_descr == "" &&
+						$ints_descr/logical-interface[name == $ifl]) ||
+						(not($ints_descr/logical-interface[name == $ifl]
+									[starts-with(description, $int_descr)]))) {
+
+				if ($debug) {
+					var $msg = "Description for interface " _ $ifl _
+								" facing the neighbor " _ $neigh_addr _
+								" changed";
+					expr jcs:syslog("external.info", $script _ ": ", $msg);
+				}
+
+				var $clear_mib_rpc = <request-snmp-utility-mib-clear> {
+					<instance> index-value;
+					<object-type> "string";
+				}
+				var $utilitymib_clear = jcs:execute($con, $clear_mib_rpc);
+
+				if ( $utilitymib_clear/../xnm:error ) {
+					var $msg = "Error clearing the Utility MIB for instance " _
+								"'" _ index-value _ "'";
+					expr jcs:syslog("external.error", $script _ ": ", $msg);
+				}
+			}
+		}
+	}
+}
